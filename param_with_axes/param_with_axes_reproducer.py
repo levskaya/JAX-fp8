@@ -280,7 +280,7 @@ class DenseGeneral(nn.Module):
 
 rules = (('batch', 'data'),
          ('hidden', 'model'),
-         ('scale_param', None),)
+         ('scale_params', None),)
 
 def run_me(iters):
   device_mesh = mesh_utils.create_device_mesh((1, 1))
@@ -293,27 +293,59 @@ def run_me(iters):
   k = random.PRNGKey(0)
   
   spmd.set_logical_axis_rules(rules)
+
+  if use_param_with_axes:
+    abstract_variables = jax.eval_shape(
+        lambda k,x: model.init(k, x_data), k, x_data)
+    logical_specs = freeze({'params': nn_partitioning.get_axis_names(
+        abstract_variables['params_axes'])})
+
+    init_in_pspec = nn_partitioning.logical_to_mesh(
+        (PartitionSpec(), PartitionSpec('batch', 'embed')), rules)
+    init_out_pspec = nn_partitioning.logical_to_mesh(logical_specs, rules)
+
+    pjit_init_fn = pjit(
+        lambda k, x: freeze({'params': model.init(k, x)['params']}),
+        in_axis_resources=init_in_pspec,
+        out_axis_resources=init_out_pspec,
+    )
+    with mesh:
+      initialized_variables = pjit_init_fn(k, x_data)
+  else:
+    jit_init_fn = jax.jit(lambda k, x: model.init(k, x))
+    initialized_variables = jit_init_fn(k, x_data)
   
-  initialized_variables = model.init(k, x_data)
   opt = optax.adam(learning_rate=.1)
-  state = TrainState.create(model_variables=initialized_variables,tx=opt,apply_fn=None)
+  state = TrainState.create(
+      model_variables=initialized_variables, tx=opt, apply_fn=None)
   
   def loss_fn(state, x, dy):
     x = spmd.with_logical_constraint(x, ('batch', 'embed'))
     dy = spmd.with_logical_constraint(dy, ('batch', 'mlp'))
-
     y = model.apply(state, x)
     loss = y * dy.astype(y.dtype)
     return jnp.sum(loss)
   
-  pjit_step_fn = pjit(
-      jax.value_and_grad(loss_fn, argnums=[0]),
-  )
+  if use_param_with_axes:
+    in_pspec = nn_partitioning.logical_to_mesh((logical_specs, 
+                                    PartitionSpec('batch', 'embed'),
+                                    PartitionSpec('batch', 'mlp')),
+                                    rules)
+    out_pspec = nn_partitioning.logical_to_mesh((PartitionSpec(), (logical_specs,)), rules)
+
+    pjit_step_fn = pjit(
+        jax.value_and_grad(loss_fn, argnums=[0]),
+        in_axis_resources=in_pspec,
+        out_axis_resources=out_pspec,
+    )
+  else:
+    pjit_step_fn = pjit(
+        jax.value_and_grad(loss_fn, argnums=[0]),
+    )
 
   with mesh:
     for _ in range(iters):
       loss, grads = pjit_step_fn(state.variables(), x_data, dy_data)
-#      print(grads)
       state = state.apply_gradients(grads=grads[0])
   return grads[0]
 
