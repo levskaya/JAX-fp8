@@ -28,6 +28,7 @@ from flax.linen import partitioning as nn_partitioning
 from flax.linen import spmd
 from flax import traverse_util
 from flax.core.frozen_dict import FrozenDict
+from flax.core import freeze, unfreeze
 
 from jax.experimental.pjit import pjit
 from jax.sharding import Mesh, PartitionSpec
